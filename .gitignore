@@ -1,1 +1,4 @@
 .direnv
+.venv
+data/*.json
+*.pyc

@@ -42,15 +42,33 @@ class CliMode(str, Enum):
 
 
 async def fetch_year(client: httpx.AsyncClient, year: int) -> List[OscarFilm]:
-    response = await client.get(
-        BASE_URL,
-        params={"ajax": "true", "year": year},
-        timeout=20.0,
-    )
-    response.raise_for_status()
-    raw_items = response.json()
-    films = [OscarFilm.model_validate(item) for item in raw_items]
-    return films
+    """
+    Busca um ano via HTTP com pequenas tentativas de retry + backoff.
+
+    Isso deixa o CLI mais resiliente a falhas momentâneas de rede/timeout,
+    mas sem esconder erros persistentes.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = await client.get(
+                BASE_URL,
+                params={"ajax": "true", "year": year},
+                timeout=20.0,
+            )
+            response.raise_for_status()
+            raw_items = response.json()
+            films = [OscarFilm.model_validate(item) for item in raw_items]
+            return films
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            last_exc = exc
+            # Backoff simples: 0.5s, 1s, 1.5s
+            if attempt < 3:
+                await asyncio.sleep(0.5 * attempt)
+            else:
+                raise
+    # Apenas para o type-checker – na prática o raise acima sempre acontece.
+    raise last_exc  # type: ignore[misc]
 
 
 async def crawl_oscar_films_ajax(years: Optional[List[int]] = None) -> List[OscarFilm]:

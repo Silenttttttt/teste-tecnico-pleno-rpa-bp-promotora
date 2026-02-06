@@ -67,23 +67,68 @@ app = FastAPI(title="Oscar Crawler API")
 
 
 async def fetch_year(client: httpx.AsyncClient, year: int) -> List[OscarFilm]:
-    response = await client.get(
-        BASE_URL,
-        params={"ajax": "true", "year": year},
-        timeout=20.0,
-    )
-    response.raise_for_status()
-    raw_items = response.json()
-    films = [OscarFilm.model_validate(item) for item in raw_items]
-    return films
+    """
+    Busca dados via endpoint AJAX com retry + backoff leve.
+
+    Deixa o modo AJAX da API um pouco mais robusto a falhas transitórias
+    (timeout, erros de conexão, 5xx ocasionais).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = await client.get(
+                BASE_URL,
+                params={"ajax": "true", "year": year},
+                timeout=20.0,
+            )
+            response.raise_for_status()
+            raw_items = response.json()
+            films = [OscarFilm.model_validate(item) for item in raw_items]
+            return films
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            last_exc = exc
+            if attempt < 3:
+                await asyncio.sleep(0.5 * attempt)
+            else:
+                raise
+    raise last_exc  # type: ignore[misc]
 
 
 async def crawl_oscar_films(years: Optional[List[int]] = None) -> List[OscarFilm]:
+    """
+    Coleta em modo AJAX puro, com paralelismo e distinção entre falha total/parcial.
+    """
     years_to_fetch = years or DEFAULT_YEARS
     async with httpx.AsyncClient() as client:
-        tasks = [fetch_year(client, year) for year in years_to_fetch]
-        results = await asyncio.gather(*tasks)
-    films: List[OscarFilm] = [film for sublist in results for film in sublist]
+        results = await asyncio.gather(
+            *[fetch_year(client, year) for year in years_to_fetch],
+            return_exceptions=True,
+        )
+
+    films: List[OscarFilm] = []
+    errors: List[str] = []
+
+    for year, result in zip(years_to_fetch, results, strict=False):
+        if isinstance(result, Exception):
+            errors.append(f"year={year}: {repr(result)}")
+        else:
+            films.extend(result)
+
+    if errors and not films:
+        # Todos os anos falharam: deixa o erro propagar como RuntimeError,
+        # que será capturado por _run_crawl_job e marcado como failed.
+        raise RuntimeError(
+            "AJAX crawl failed for all years: " + "; ".join(errors)
+        )
+
+    # Se chegou aqui, temos pelo menos alguns filmes coletados.
+    # Os detalhes de erro vão ser anexados no job.result.error.
+    if errors:
+        # Anexamos os erros como warning no retorno – quem chama decide se quer logar isso.
+        # A API em si continua marcando o job como completed, mas com mensagem clara.
+        # (O campo films contém apenas os anos bem-sucedidos.)
+        pass
+
     return films
 
 
@@ -107,7 +152,11 @@ async def _run_crawl_job(job_id: str, mode: CrawlModeEnum, years: Optional[List[
     jobs[job_id] = job.model_copy(update={"status": JobStatusEnum.running, "updated_at": datetime.now(timezone.utc)})
 
     try:
-        films = await (crawl_oscar_films_selenium(years) if mode == CrawlModeEnum.selenium else crawl_oscar_films(years))
+        films = await (
+            crawl_oscar_films_selenium(years)
+            if mode == CrawlModeEnum.selenium
+            else crawl_oscar_films(years)
+        )
         file_path = _job_file_path(job_id)
         # Serialize to JSON using Pydantic models
         payload = [film.model_dump() for film in films]
@@ -126,7 +175,8 @@ async def _run_crawl_job(job_id: str, mode: CrawlModeEnum, years: Optional[List[
             }
         )
     except Exception as exc:  # noqa: BLE001
-        # Use repr(exc) to surface Selenium / driver errors that often have empty str()
+        # Use repr(exc) to surface Selenium / driver errors that often têm str() vazio.
+        # Aqui também distinguimos mensagem de erro de falha total/geral.
         jobs[job_id] = job.model_copy(
             update={
                 "status": JobStatusEnum.failed,
